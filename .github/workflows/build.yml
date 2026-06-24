@@ -23,25 +23,23 @@ on:
         required: false
         type: string
 
-  # ── 首次推送到仓库时，自动编译当前上游最新的 stable + prerelease ──
+  # ── 首次推送 build.yml 到主分支时，自动编译当前上游最新的 stable + prerelease ──
   push:
     branches:
       - main   # ← 改成你的默认分支名
     paths:
-      - '.github/workflows/build.yml'  # 只在 build.yml 自身被修改时触发初始编译
+      - '.github/workflows/build.yml'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 编译矩阵：
-#   Windows  x86 / amd64 / arm64  (cross-compile via CMake + MSVC / MinGW)
-#   Linux    x86 / amd64 / arm64  (cross-compile via CMake + GCC)
-#   macOS    amd64 / arm64        (macos-13=Intel amd64, macos-14=Apple Silicon arm64)
-#
-# 注：GitHub 托管 runner 暂无 Windows arm64 runner，改用 QEMU / 交叉编译
+# 编译目标：
+#   Linux   x86 / amd64 / arm64
+#   Windows amd64
+#   macOS   arm64 (Apple Silicon M1+)
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
-  # 1. 初始化：获取要编译的 tag（push 触发时需要自动查询上游）
+  # 1. 初始化：获取要编译的 tag（push 触发时自动查询上游）
   # ════════════════════════════════════════════════════════════════════════════
   init:
     name: Resolve tags to build
@@ -56,7 +54,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -n "${{ github.event.inputs.tag }}" ]; then
-            # workflow_dispatch 时只编译指定 tag
             TAG="${{ github.event.inputs.tag }}"
             IS_PRE="${{ github.event.inputs.prerelease }}"
             RNAME="${{ github.event.inputs.release_name }}"
@@ -69,7 +66,6 @@ jobs:
               --argjson body "$RBODY" \
               '{include:[{tag:$tag, prerelease:$pre, release_name:$name, release_body:$body}]}')
           else
-            # push 触发：自动拉取上游 latest stable + latest prerelease
             STABLE=$(curl -fsSL \
               -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/ntop/n2n/releases/latest")
@@ -87,7 +83,6 @@ jobs:
             PRE_BODY=$(echo "$PRE" | jq '.body // ""')
 
             if [ "$STABLE_TAG" = "$PRE_TAG" ] || [ -z "$PRE_TAG" ] || [ "$PRE_TAG" = "null" ]; then
-              # stable 和 pre 是同一个或没有 pre：只编译 stable
               MATRIX=$(jq -cn \
                 --arg tag "$STABLE_TAG" \
                 --arg name "$STABLE_NAME" \
@@ -108,7 +103,7 @@ jobs:
           echo "Matrix: $MATRIX"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # 2. 编译 Linux（x86 / amd64 / arm64，使用 QEMU + Docker buildx 交叉编译）
+  # 2. Linux：x86 / amd64 / arm64
   # ════════════════════════════════════════════════════════════════════════════
   build-linux:
     name: Linux ${{ matrix.arch }} — ${{ matrix.release.tag }}
@@ -121,50 +116,49 @@ jobs:
         arch: [x86, amd64, arm64]
 
     steps:
-      - name: Checkout source from ntop/n2n @ ${{ matrix.release.tag }}
+      - name: Checkout ntop/n2n @ ${{ matrix.release.tag }}
         uses: actions/checkout@v4
         with:
           repository: ntop/n2n
           ref: ${{ matrix.release.tag }}
           submodules: recursive
 
-      - name: Set up QEMU (for cross-compile)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Install cross-compile toolchain
+      - name: Install toolchain
         run: |
           sudo apt-get update -qq
           case "${{ matrix.arch }}" in
             x86)
-              sudo apt-get install -y gcc-multilib g++-multilib cmake \
-                libssl-dev:i386 2>/dev/null || \
               sudo apt-get install -y gcc-multilib g++-multilib cmake
               ;;
             amd64)
-              sudo apt-get install -y cmake libssl-dev build-essential
+              sudo apt-get install -y cmake build-essential
               ;;
             arm64)
               sudo apt-get install -y \
-                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-                cmake libssl-dev
+                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake
               ;;
           esac
 
       - name: Configure & build
         run: |
           mkdir build && cd build
+          # -DCMAKE_POLICY_VERSION_MINIMUM=3.5 兼容 n2n 老版本 CMakeLists.txt
           case "${{ matrix.arch }}" in
             x86)
               cmake .. \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                 -DCMAKE_C_FLAGS="-m32" \
                 -DCMAKE_EXE_LINKER_FLAGS="-m32" \
                 -DCMAKE_BUILD_TYPE=Release
               ;;
             amd64)
-              cmake .. -DCMAKE_BUILD_TYPE=Release
+              cmake .. \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                -DCMAKE_BUILD_TYPE=Release
               ;;
             arm64)
               cmake .. \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                 -DCMAKE_SYSTEM_NAME=Linux \
                 -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
                 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
@@ -174,19 +168,15 @@ jobs:
           esac
           cmake --build . --parallel $(nproc)
 
-      - name: Package artifacts
+      - name: Package
         run: |
-          ARCH="${{ matrix.arch }}"
           TAG="${{ matrix.release.tag }}"
+          ARCH="${{ matrix.arch }}"
           OUTDIR="dist/n2n-${TAG}-linux-${ARCH}"
           mkdir -p "$OUTDIR"
-
-          # 复制可执行文件（忽略测试二进制）
           for bin in build/edge build/supernode build/tools/n2n-benchmark; do
             [ -f "$bin" ] && cp "$bin" "$OUTDIR/"
           done
-
-          # 压缩
           cd dist
           tar -czf "n2n-${TAG}-linux-${ARCH}.tar.gz" "n2n-${TAG}-linux-${ARCH}/"
           echo "ASSET=dist/n2n-${TAG}-linux-${ARCH}.tar.gz" >> "$GITHUB_ENV"
@@ -199,185 +189,78 @@ jobs:
           retention-days: 1
 
   # ════════════════════════════════════════════════════════════════════════════
-  # 3. 编译 Windows（x86 / amd64 / arm64，MinGW 交叉编译）
+  # 3. Windows amd64（MinGW 交叉编译）
   # ════════════════════════════════════════════════════════════════════════════
-  build-windows:
-    name: Windows ${{ matrix.arch }} — ${{ matrix.release.tag }}
+  build-windows-amd64:
+    name: Windows amd64 — ${{ matrix.release.tag }}
     needs: init
-    runs-on: ubuntu-latest   # 用 Linux runner + MinGW 交叉编译 Windows 二进制
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         release: ${{ fromJson(needs.init.outputs.matrix).include }}
-        arch: [x86, amd64, arm64]
 
     steps:
-      - name: Checkout source from ntop/n2n @ ${{ matrix.release.tag }}
+      - name: Checkout ntop/n2n @ ${{ matrix.release.tag }}
         uses: actions/checkout@v4
         with:
           repository: ntop/n2n
           ref: ${{ matrix.release.tag }}
           submodules: recursive
 
-      - name: Install MinGW cross-compile toolchain
+      - name: Install MinGW toolchain
         run: |
           sudo apt-get update -qq
-          case "${{ matrix.arch }}" in
-            x86)
-              sudo apt-get install -y \
-                mingw-w64 cmake
-              ;;
-            amd64)
-              sudo apt-get install -y \
-                mingw-w64 cmake
-              ;;
-            arm64)
-              # llvm-mingw supports Windows ARM64
-              sudo apt-get install -y cmake wget
-              # 下载 llvm-mingw (支持 aarch64-w64-mingw32)
-              LLVM_VER="20240619"
-              wget -q "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_VER}/llvm-mingw-${LLVM_VER}-ucrt-ubuntu-22.04-x86_64.tar.xz" \
-                -O /tmp/llvm-mingw.tar.xz
-              tar -xf /tmp/llvm-mingw.tar.xz -C /opt
-              echo "/opt/llvm-mingw-${LLVM_VER}-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
-              ;;
-          esac
-
-      - name: Configure & build (Windows)
-        run: |
-          mkdir build && cd build
-          # -liphlpapi 是必须的：GetAdaptersInfo / GetAdaptersAddresses 等网络 API
-          # 都在 iphlpapi.dll 中，MinGW 不会自动链接它
-          EXTRA_LINK="-liphlpapi -lws2_32"
-          case "${{ matrix.arch }}" in
-            x86)
-              cmake .. \
-                -DCMAKE_SYSTEM_NAME=Windows \
-                -DCMAKE_C_COMPILER=i686-w64-mingw32-gcc \
-                -DCMAKE_CXX_COMPILER=i686-w64-mingw32-g++ \
-                -DCMAKE_RC_COMPILER=i686-w64-mingw32-windres \
-                -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LINK" \
-                -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LINK" \
-                -DCMAKE_BUILD_TYPE=Release
-              ;;
-            amd64)
-              cmake .. \
-                -DCMAKE_SYSTEM_NAME=Windows \
-                -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-                -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
-                -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
-                -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LINK" \
-                -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LINK" \
-                -DCMAKE_BUILD_TYPE=Release
-              ;;
-            arm64)
-              # llvm-mingw 用 clang，不是 gcc
-              cmake .. \
-                -DCMAKE_SYSTEM_NAME=Windows \
-                -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-                -DCMAKE_C_COMPILER=aarch64-w64-mingw32-clang \
-                -DCMAKE_CXX_COMPILER=aarch64-w64-mingw32-clang++ \
-                -DCMAKE_RC_COMPILER=aarch64-w64-mingw32-windres \
-                -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LINK" \
-                -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LINK" \
-                -DCMAKE_BUILD_TYPE=Release
-              ;;
-          esac
-          cmake --build . --parallel $(nproc)
-
-      - name: Package artifacts
-        run: |
-          ARCH="${{ matrix.arch }}"
-          TAG="${{ matrix.release.tag }}"
-          OUTDIR="dist/n2n-${TAG}-windows-${ARCH}"
-          mkdir -p "$OUTDIR"
-
-          for bin in build/edge.exe build/supernode.exe build/tools/n2n-benchmark.exe; do
-            [ -f "$bin" ] && cp "$bin" "$OUTDIR/"
-          done
-
-          # 复制 MinGW 运行时 DLL（如果需要）
-          find build -name "*.dll" -exec cp {} "$OUTDIR/" \; 2>/dev/null || true
-
-          cd dist
-          zip -r "n2n-${TAG}-windows-${ARCH}.zip" "n2n-${TAG}-windows-${ARCH}/"
-          echo "ASSET=dist/n2n-${TAG}-windows-${ARCH}.zip" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: n2n-${{ matrix.release.tag }}-windows-${{ matrix.arch }}
-          path: ${{ env.ASSET }}
-          retention-days: 1
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # 4a. 编译 macOS Intel (amd64)
-  # ════════════════════════════════════════════════════════════════════════════
-  build-macos-amd64:
-    name: macOS amd64 — ${{ matrix.release.tag }}
-    needs: init
-    runs-on: macos-13   # Intel runner
-    strategy:
-      fail-fast: false
-      matrix:
-        release: ${{ fromJson(needs.init.outputs.matrix).include }}
-
-    steps:
-      - name: Checkout source from ntop/n2n @ ${{ matrix.release.tag }}
-        uses: actions/checkout@v4
-        with:
-          repository: ntop/n2n
-          ref: ${{ matrix.release.tag }}
-          submodules: recursive
-
-      - name: Install dependencies
-        run: brew install cmake openssl
+          sudo apt-get install -y mingw-w64 cmake
 
       - name: Configure & build
         run: |
           mkdir build && cd build
           cmake .. \
-            -DCMAKE_OSX_ARCHITECTURES="x86_64" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
-          cmake --build . --parallel $(sysctl -n hw.logicalcpu)
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DCMAKE_EXE_LINKER_FLAGS="-liphlpapi -lws2_32" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-liphlpapi -lws2_32" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --parallel $(nproc)
 
-      - name: Package artifacts
+      - name: Package
         run: |
           TAG="${{ matrix.release.tag }}"
-          OUTDIR="dist/n2n-${TAG}-macos-amd64"
+          OUTDIR="dist/n2n-${TAG}-windows-amd64"
           mkdir -p "$OUTDIR"
-          for bin in build/edge build/supernode build/tools/n2n-benchmark; do
+          for bin in build/edge.exe build/supernode.exe build/tools/n2n-benchmark.exe; do
             [ -f "$bin" ] && cp "$bin" "$OUTDIR/"
           done
-          for f in "$OUTDIR"/*; do
-            codesign --force --sign - "$f" 2>/dev/null || true
-          done
+          find build -name "*.dll" -exec cp {} "$OUTDIR/" \; 2>/dev/null || true
           cd dist
-          tar -czf "n2n-${TAG}-macos-amd64.tar.gz" "n2n-${TAG}-macos-amd64/"
-          echo "ASSET=dist/n2n-${TAG}-macos-amd64.tar.gz" >> "$GITHUB_ENV"
+          zip -r "n2n-${TAG}-windows-amd64.zip" "n2n-${TAG}-windows-amd64/"
+          echo "ASSET=dist/n2n-${TAG}-windows-amd64.zip" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: n2n-${{ matrix.release.tag }}-macos-amd64
+          name: n2n-${{ matrix.release.tag }}-windows-amd64
           path: ${{ env.ASSET }}
           retention-days: 1
 
   # ════════════════════════════════════════════════════════════════════════════
-  # 4b. 编译 macOS Apple Silicon (arm64 / M1+)
+  # 4. macOS arm64（Apple Silicon M1+，macos-14 原生 runner）
   # ════════════════════════════════════════════════════════════════════════════
   build-macos-arm64:
     name: macOS arm64 — ${{ matrix.release.tag }}
     needs: init
-    runs-on: macos-14   # Apple Silicon runner (M1)
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
         release: ${{ fromJson(needs.init.outputs.matrix).include }}
 
     steps:
-      - name: Checkout source from ntop/n2n @ ${{ matrix.release.tag }}
+      - name: Checkout ntop/n2n @ ${{ matrix.release.tag }}
         uses: actions/checkout@v4
         with:
           repository: ntop/n2n
@@ -391,12 +274,13 @@ jobs:
         run: |
           mkdir build && cd build
           cmake .. \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_OSX_ARCHITECTURES="arm64" \
             -DCMAKE_BUILD_TYPE=Release \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
           cmake --build . --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: Package artifacts
+      - name: Package
         run: |
           TAG="${{ matrix.release.tag }}"
           OUTDIR="dist/n2n-${TAG}-macos-arm64"
@@ -423,7 +307,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   release:
     name: Create Release — ${{ matrix.release.tag }}
-    needs: [init, build-linux, build-windows, build-macos-amd64, build-macos-arm64]
+    needs: [init, build-linux, build-windows-amd64, build-macos-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -443,7 +327,6 @@ jobs:
         run: find artifacts -type f | sort
 
       - name: Prepare release body
-        id: body
         run: |
           TAG="${{ matrix.release.tag }}"
           UPSTREAM_BODY="${{ matrix.release.release_body }}"
@@ -453,16 +336,13 @@ jobs:
             echo "本 Release 由 GitHub Actions 自动从 [ntop/n2n](https://github.com/ntop/n2n/releases/tag/${TAG}) 编译生成。"
             echo ""
             echo "### 平台支持"
-            echo "| 平台 | 架构 | 文件 |"
-            echo "|------|------|------|"
-            echo "| Linux  | x86    | \`n2n-${TAG}-linux-x86.tar.gz\`     |"
-            echo "| Linux  | amd64  | \`n2n-${TAG}-linux-amd64.tar.gz\`   |"
-            echo "| Linux  | arm64  | \`n2n-${TAG}-linux-arm64.tar.gz\`   |"
-            echo "| Windows| x86    | \`n2n-${TAG}-windows-x86.zip\`      |"
-            echo "| Windows| amd64  | \`n2n-${TAG}-windows-amd64.zip\`    |"
-            echo "| Windows| arm64  | \`n2n-${TAG}-windows-arm64.zip\`    |"
-            echo "| macOS  | amd64  | \`n2n-${TAG}-macos-amd64.tar.gz\`   |"
-            echo "| macOS  | arm64 (M1+) | \`n2n-${TAG}-macos-arm64.tar.gz\` |"
+            echo "| 平台    | 架构   | 文件 |"
+            echo "|---------|--------|------|"
+            echo "| Linux   | x86    | \`n2n-${TAG}-linux-x86.tar.gz\`      |"
+            echo "| Linux   | amd64  | \`n2n-${TAG}-linux-amd64.tar.gz\`    |"
+            echo "| Linux   | arm64  | \`n2n-${TAG}-linux-arm64.tar.gz\`    |"
+            echo "| Windows | amd64  | \`n2n-${TAG}-windows-amd64.zip\`     |"
+            echo "| macOS   | arm64 (M1+) | \`n2n-${TAG}-macos-arm64.tar.gz\` |"
             echo ""
             echo "---"
             echo ""
@@ -470,7 +350,6 @@ jobs:
             echo ""
             echo "${UPSTREAM_BODY}"
           } > release_body.md
-          echo "body_file=release_body.md" >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
