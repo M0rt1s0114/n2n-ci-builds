@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # 检出所有分支，包括 gh-pages 或默认分支，用于保存状态
           fetch-depth: 1
