@@ -1,0 +1,196 @@
+name: Check n2n Upstream Release
+
+on:
+  schedule:
+    # 北京时间凌晨 2:00 = UTC 18:00 (前一天)
+    - cron: '0 18 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  check-release:
+    name: Check ntop/n2n for new releases
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 用于读写 release-state.json
+      actions: write   # 用于触发 build workflow
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          # 检出所有分支，包括 gh-pages 或默认分支，用于保存状态
+          fetch-depth: 1
+
+      # ── 拉取上游最新 stable release ──────────────────────────────────
+      - name: Fetch latest stable release from ntop/n2n
+        id: stable
+        run: |
+          RESPONSE=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/ntop/n2n/releases/latest")
+
+          TAG=$(echo "$RESPONSE" | jq -r '.tag_name')
+          IS_PRE=$(echo "$RESPONSE" | jq -r '.prerelease')
+          NAME=$(echo "$RESPONSE" | jq -r '.name')
+          BODY=$(echo "$RESPONSE" | jq -r '.body // ""')
+
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "prerelease=$IS_PRE" >> "$GITHUB_OUTPUT"
+          # 多行 body 用 heredoc 写入
+          {
+            echo "body<<__EOF__"
+            echo "$BODY"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+          echo "name=$NAME"       >> "$GITHUB_OUTPUT"
+          echo "Stable release: $TAG (prerelease=$IS_PRE)"
+
+      # ── 拉取最新的 prerelease（含 draft=false 的全部 release 列表）──
+      - name: Fetch latest pre-release from ntop/n2n
+        id: prerelease
+        run: |
+          # /releases 返回最新 30 条（含 prerelease），取第一个 prerelease=true 的
+          RESPONSE=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/ntop/n2n/releases?per_page=30")
+
+          PRE=$(echo "$RESPONSE" | jq '[.[] | select(.prerelease==true and .draft==false)] | first')
+
+          if [ "$PRE" = "null" ] || [ -z "$PRE" ]; then
+            echo "tag="           >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "body="          >> "$GITHUB_OUTPUT"
+            echo "name="          >> "$GITHUB_OUTPUT"
+            echo "No pre-release found upstream."
+          else
+            TAG=$(echo "$PRE" | jq -r '.tag_name')
+            NAME=$(echo "$PRE" | jq -r '.name')
+            BODY=$(echo "$PRE" | jq -r '.body // ""')
+            echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"   >> "$GITHUB_OUTPUT"
+            {
+              echo "body<<__EOF__"
+              echo "$BODY"
+              echo "__EOF__"
+            } >> "$GITHUB_OUTPUT"
+            echo "name=$NAME"        >> "$GITHUB_OUTPUT"
+            echo "Pre-release: $TAG"
+          fi
+
+      # ── 读取本仓库已记录的状态（避免重复触发编译）───────────────────
+      - name: Read last built state
+        id: state
+        run: |
+          STATE_FILE=".github/release-state.json"
+          if [ -f "$STATE_FILE" ]; then
+            LAST_STABLE=$(jq -r '.stable // ""'   "$STATE_FILE")
+            LAST_PRE=$(jq -r '.prerelease // ""'  "$STATE_FILE")
+          else
+            LAST_STABLE=""
+            LAST_PRE=""
+          fi
+          echo "last_stable=$LAST_STABLE"     >> "$GITHUB_OUTPUT"
+          echo "last_prerelease=$LAST_PRE"    >> "$GITHUB_OUTPUT"
+          echo "Last built → stable: $LAST_STABLE | pre: $LAST_PRE"
+
+      # ── 判断是否需要触发编译 ─────────────────────────────────────────
+      - name: Decide what to build
+        id: decide
+        run: |
+          NEW_STABLE="${{ steps.stable.outputs.tag }}"
+          NEW_PRE="${{ steps.prerelease.outputs.tag }}"
+          LAST_STABLE="${{ steps.state.outputs.last_stable }}"
+          LAST_PRE="${{ steps.state.outputs.last_prerelease }}"
+
+          BUILD_STABLE="false"
+          BUILD_PRE="false"
+
+          if [ -n "$NEW_STABLE" ] && [ "$NEW_STABLE" != "$LAST_STABLE" ]; then
+            BUILD_STABLE="true"
+            echo "✅ New stable release detected: $NEW_STABLE"
+          fi
+
+          if [ -n "$NEW_PRE" ] && [ "$NEW_PRE" != "$LAST_PRE" ]; then
+            BUILD_PRE="true"
+            echo "✅ New pre-release detected: $NEW_PRE"
+          fi
+
+          echo "build_stable=$BUILD_STABLE"   >> "$GITHUB_OUTPUT"
+          echo "build_pre=$BUILD_PRE"         >> "$GITHUB_OUTPUT"
+
+      # ── 触发 stable 编译工作流 ────────────────────────────────────────
+      - name: Trigger build for stable release
+        if: steps.decide.outputs.build_stable == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build.yml',
+              ref: 'main',   // ← 改成你的默认分支名
+              inputs: {
+                tag:        '${{ steps.stable.outputs.tag }}',
+                prerelease: 'false',
+                release_name: '${{ steps.stable.outputs.name }}',
+                release_body: `${{ steps.stable.outputs.body }}`
+              }
+            });
+            console.log('Triggered stable build for ${{ steps.stable.outputs.tag }}');
+
+      # ── 触发 pre-release 编译工作流 ───────────────────────────────────
+      - name: Trigger build for pre-release
+        if: steps.decide.outputs.build_pre == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build.yml',
+              ref: 'main',   // ← 改成你的默认分支名
+              inputs: {
+                tag:        '${{ steps.prerelease.outputs.tag }}',
+                prerelease: 'true',
+                release_name: '${{ steps.prerelease.outputs.name }}',
+                release_body: `${{ steps.prerelease.outputs.body }}`
+              }
+            });
+            console.log('Triggered pre-release build for ${{ steps.prerelease.outputs.tag }}');
+
+      # ── 更新状态文件，防止下次重复触发 ──────────────────────────────
+      - name: Update release-state.json
+        if: steps.decide.outputs.build_stable == 'true' || steps.decide.outputs.build_pre == 'true'
+        run: |
+          STATE_FILE=".github/release-state.json"
+
+          # 取已有的值（若本次没更新就保留旧值）
+          OLD_STABLE="${{ steps.state.outputs.last_stable }}"
+          OLD_PRE="${{ steps.state.outputs.last_prerelease }}"
+
+          NEW_STABLE="${{ steps.decide.outputs.build_stable }}" 
+          NEW_PRE_FLAG="${{ steps.decide.outputs.build_pre }}"
+
+          STABLE_TAG=$([ "$NEW_STABLE" = "true" ] && \
+            echo "${{ steps.stable.outputs.tag }}" || echo "$OLD_STABLE")
+          PRE_TAG=$([ "$NEW_PRE_FLAG" = "true" ] && \
+            echo "${{ steps.prerelease.outputs.tag }}" || echo "$OLD_PRE")
+
+          mkdir -p .github
+          cat > "$STATE_FILE" <<EOF
+          {
+            "stable":     "$STABLE_TAG",
+            "prerelease": "$PRE_TAG",
+            "updated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+          git commit -m "chore: update release-state.json [skip ci]" || true
+          git push
