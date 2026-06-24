@@ -277,7 +277,8 @@ jobs:
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_OSX_ARCHITECTURES="arm64" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
+            -DCMAKE_C_FLAGS="-Wno-incompatible-function-pointer-types"
           cmake --build . --parallel $(sysctl -n hw.logicalcpu)
 
       - name: Package
